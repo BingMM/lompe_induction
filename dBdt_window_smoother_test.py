@@ -192,6 +192,12 @@ for i, t in tqdm(enumerate(times), total=times.size):
     Gs.append(model._G)
     ws.append(model._w)
     ds.append(model._d)
+
+#%% Step 3: E induction
+
+# Something with window size
+# Loop over time while sliding window
+
     
 #%% Combine steady-state stuff
 
