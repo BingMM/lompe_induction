@@ -1,6 +1,5 @@
 #%% Import
 
-import sys
 import numpy as np
 import pandas as pd
 from datetime import timedelta
@@ -58,20 +57,25 @@ def prepare_data(t0, t1):
     
     return amp_data, sm_data, sd_data
 
+#%% Paths
+
+path_in  = '/home/bing/BCSS-DAG Dropbox/Michael Madelaire/work/code/standard_lompe/lompe/examples/sample_dataset/'
+path_out = '/home/bing/BCSS-DAG Dropbox/Michael Madelaire/work/code/repos/lompe_induction/'
+
 #%% Load data
 
 # Data filename
-supermagfn = '/home/bing/BCSS-DAG Dropbox/Michael Madelaire/work/code/standard_lompe/lompe/examples/sample_dataset/20120405_supermag.h5'
-superdarnfn = '/home/bing/BCSS-DAG Dropbox/Michael Madelaire/work/code/standard_lompe/lompe/examples/sample_dataset/20120405_superdarn_grdmap.h5'
-iridiumfn = '/home/bing/BCSS-DAG Dropbox/Michael Madelaire/work/code/standard_lompe/lompe/examples/sample_dataset/20120405_iridium.h5'
+supermagfn  = path_in + '20120405_supermag.h5'
+superdarnfn = path_in + '20120405_superdarn_grdmap.h5'
+iridiumfn   = path_in + '20120405_iridium.h5'
 
 # load ampere, supermag, and superdarn data from 2012-04-05
 ampere    = pd.read_hdf(iridiumfn)
 supermag  = pd.read_hdf(supermagfn)
 superdarn = pd.read_hdf(superdarnfn)
 
-times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min')
-DT = timedelta(seconds = 2 * 60) # will select data from +- DT
+times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min')[:100] # Limiting testing to the first 100, instead of all 480 times
+DT    = timedelta(seconds = 2 * 60) # will select data from +- DT
 
 #%% Define grid
 
@@ -95,6 +99,7 @@ _, _, Gu_pred = get_SECS_B_G_matrices(grid.lat.flatten(), grid.lon.flatten(),
                                       6371.2*1e3, grid.lat_mesh.flatten(), grid.lon_mesh.flatten(), 
                                       singularity_limit = s_limit)
 
+# SECS fit
 for i, t in tqdm(enumerate(times), total=len(times)):
     
     amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
@@ -117,38 +122,58 @@ for i, t in tqdm(enumerate(times), total=len(times)):
     
     Bu_pred[:, :, i] = Gu_pred.dot(m).reshape(grid.shape)
 
-if True:
-    plt.ioff()
-    vmax = np.max(abs(Bu_pred))
-    clvls = np.linspace(-vmax, vmax, 20)
-    for i, t in tqdm(enumerate(times), total=len(times)):
-        amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
-        f = grid.ingrid(sm_data.coords['lon'], sm_data.coords['lat'])
-        xi, eta = grid.projection.geo2cube(sm_data.coords['lon'][f], sm_data.coords['lat'][f])
-        
-        fig = plt.figure()
-        plt.contourf(grid.xi, grid.eta, Bu_pred[:, :, i], levels=clvls, cmap='bwr')
-        plt.plot(xi, eta, '.', markersize=10, color='magenta')
-        plt.savefig('/home/bing/BCSS-DAG Dropbox/Michael Madelaire/work/temp_storage/SECS_Bu/{}.png'.format(i), bbox_inches='tight')
-        plt.close('all')
-    plt.ion()
+#%% Step 1: SECS of all time steps - Plot reconstruction
+    
+plt.ioff()
+vmax = np.max(abs(Bu_pred))
+clvls = np.linspace(-vmax, vmax, 20)
+    
+fig = plt.figure(figsize=(10,10))
+    
+amp_data, sm_data, sd_data = prepare_data(times[0] - DT, times[0] + DT)
+f = grid.ingrid(sm_data.coords['lon'], sm_data.coords['lat'])
+xi, eta = grid.projection.geo2cube(sm_data.coords['lon'][f], sm_data.coords['lat'][f])
+plt.plot(xi, eta, '.', markersize=10, markerfacecolor='magenta', markeredgecolor='k', zorder=3)
+    
+for cl in grid.projection.get_projected_coastlines():
+    xi, eta = cl
+    plt.plot(xi, eta, linewidth=2, color='k', zorder=0)
+    plt.plot(xi, eta, linewidth=1, color='cyan', zorder=1)
 
+for i, t in tqdm(enumerate(times), total=len(times)):
+    
+    cc = plt.contourf(grid.xi, grid.eta, Bu_pred[:, :, i]*1e9, levels=clvls*1e9, cmap='bwr', zorder=-1)
+    if i == 0:
+        cax = plt.colorbar(cc)
+        cax.set_label('Bu [nT]', fontsize=16)
+    
+        plt.xlim([grid.xi_min, grid.xi_max])
+        plt.ylim([grid.eta_min, grid.eta_max])
+        plt.xlabel('xi', fontsize=16)
+        plt.ylabel('eta', fontsize=16)
+        plt.gca().set_aspect('equal')
+    
+    plt.title('SECS reconstruction of Bu using Supermag: t={}'.format(i), fontsize=18)
+    plt.savefig(path_out + 'figures/SECS_Bu/{}.png'.format(i), bbox_inches='tight')
+    
+    for c in cc.collections:
+        c.remove()
+    
+plt.close('all')
+plt.ion()
 
-#%% Step 2
+#%% Step 2: dBr/dt
 
-dBudt_pred = np.zeros((Bu_pred.shape[0], Bu_pred.shape[1], Bu_pred.shape[2]-1))
-for i in range(dBudt_pred.shape[2]):
-    dBudt_pred[:, :, i] = Bu_pred[:, :, i+1] - Bu_pred[:, :, i]
-#dBudt_pred = np.diff(Bu_pred, axis=2)
+dBudt_pred = np.diff(Bu_pred, axis=2, prepend=Bu_pred[:, :, -1:])[:, :, 1:]
 
-#%% Step 3
+#%% Step 3: E induction - Standard Lompe inversion for comparison and get relevant matrices
 
 GsBu = []
 Gs = []
 ws = []
 ds = []
 
-for i, t in tqdm(enumerate(times)):
+for i, t in tqdm(enumerate(times), total=times.size):
     
     SH = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'hall'    )
     SP = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'pedersen')
