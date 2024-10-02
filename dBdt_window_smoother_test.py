@@ -74,7 +74,7 @@ ampere    = pd.read_hdf(iridiumfn)
 supermag  = pd.read_hdf(supermagfn)
 superdarn = pd.read_hdf(superdarnfn)
 
-times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min')[:100] # Limiting testing to the first 100, instead of all 480 times
+times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min')[:20] # Limiting testing to the first 100, instead of all 480 times
 DT    = timedelta(seconds = 2 * 60) # will select data from +- DT
 
 #%% Define grid
@@ -195,53 +195,57 @@ for i, t in tqdm(enumerate(times), total=times.size):
 
 #%% Step 3: E induction
 
-# Something with window size
-# Loop over time while sliding window
+w_size = 3
+ms = np.zeros((grid.xi_mesh.size, times.size))
 
+for i, t in tqdm(enumerate(times), total=times.size):
     
-#%% Combine steady-state stuff
-
-G_ss = scipy.linalg.block_diag(*Gs)
-d_ss = np.hstack(ds)
-w_ss = np.hstack(ws)
-
-#%% Combine temporal stuff
-
-for i in range(len(GsBu)-1):
-    G_bs_i = np.zeros((grid.size, grid.xi_mesh.size*(times.size)))
-
-    G_bs_i[:, i*grid.xi_mesh.size:(i+1)*grid.xi_mesh.size] = -1*GsBu[i]
-    try:
-        G_bs_i[:, (i+1)*grid.xi_mesh.size:(i+2)*grid.xi_mesh.size] = GsBu[i+1]
-    except:
-        G_bs_i[:, (i+1)*grid.xi_mesh.size:] = GsBu[i+1]
+    j_mid = w_size + 0 # The window is 2*w_size+1 wide.
     
-    if i == 0:
-        G_bs = G_bs_i + 0
-    else:
-        G_bs = np.vstack((G_bs, G_bs_i))
+    i_start = i - w_size # The first timestep 
+    i_stop = i + w_size # The last timestep
+    
+    # Ensure first timestep cannot be smaller than 0
+    if i_start < 0:
+        j_mid += i_start # If, e.g., -1 set to 0 and move j_mid down by 1.
+        i_start = 0
+    
+    # Ensure last timestep does not exceed times.size-1.
+    if i_stop > (times.size-1):
+        j_mid -= i_stop - times.size-1 # If, e.g., 2 over max set to max and move j_mid down by 2.
+        i_stop = times.size-1 # 1 is added later as last index is exclusive. Silly Python.
+    
+    nt = i_stop-i_start+1 # Number of timesteps included in this window
+    
+    # Generate matrices - Steady state
+    G_ss = scipy.linalg.block_diag(*Gs[i_start:i_stop+1])
+    d_ss = np.hstack(ds[i_start:i_stop+1])
+    w_ss = np.hstack(ws[i_start:i_stop+1])
 
-d_bs = dBudt_pred.flatten()
+    # Generate matrices - Temporal
+    G_t = np.zeros(((nt-1)*grid.size, nt*grid.xi_mesh.size)) # Allocate space
+    G_t[:, 0:(nt-1)*grid.xi_mesh.size]             = - scipy.linalg.block_diag(*GsBu[i_start:i_stop])
+    G_t[:, grid.xi_mesh.size:nt*grid.xi_mesh.size] = scipy.linalg.block_diag(*GsBu[i_start+1:i_stop+1])
+    
+    d_t = dBudt_pred[:, :, i_start:i_stop].flatten()
+    
+    w_t = np.ones(d_t.size) / (1*1e-9)**2    
 
-w_bs = np.ones(d_bs.size) / (1*1e-9)**2
+    # Combine matrices
+    G = np.vstack((G_ss, G_t))
+    d = np.hstack((d_ss, d_t))
+    w = np.hstack((w_ss, w_t))
 
-#%% Combine
+    # Solve inverse problem
+    GTG = G.T.dot(np.diag(w)).dot(G)
+    GTd = G.T.dot(np.diag(w)).dot(d)
 
-G = np.vstack((G_ss, G_bs))
-d = np.hstack((d_ss, d_bs))
-w = np.hstack((w_ss, w_bs))
+    gtgmag = np.median(abs(np.diag(GTG)))
 
-#%%
-
-GTG = G.T.dot(np.diag(w)).dot(G)
-GTd = G.T.dot(np.diag(w)).dot(d)
-
-gtgmag = np.median(abs(np.diag(GTG)))
-
-m = scipy.linalg.solve(GTG + 2e0*gtgmag*np.eye(GTG.shape[0]), GTd)
-ms = m.reshape((times.size, grid.xi_mesh.size)).T
-
-#%%
+    m = scipy.linalg.solve(GTG + 2e0*gtgmag*np.eye(GTG.shape[0]), GTd)
+    ms[:, i] = m.reshape((nt, grid.xi_mesh.size)).T[:, j_mid]
+    
+#%% Step 4: Visualization
 
 Bu_org = np.zeros((grid.xi_mesh.size, times.size))
 Bu_new = np.zeros((grid.xi_mesh.size, times.size))
@@ -262,7 +266,7 @@ for i, t in tqdm(enumerate(times)):
     model.add_data(amp_data, sm_data, sd_data)
     gtg, ltl = model.run_inversion(l1 = 2, l2 = 0)
 
-    savepath = '/scratch/BCSS-DAG Dropbox/Michael Madelaire/work/projects/lompe_induction_cheat/figures/lompe/'
+    savepath = path_out + 'figures/lompe/'
     savefile = savepath + str(t).replace(' ','_').replace(':','')
     lompe.lompeplot(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
     
@@ -270,7 +274,7 @@ for i, t in tqdm(enumerate(times)):
     Bu_org[:, i] = Bu
     
     model.m = ms[:, i]
-    savepath = '/scratch/BCSS-DAG Dropbox/Michael Madelaire/work/projects/lompe_induction_cheat/figures/lompe_dbdt/'
+    savepath = path_out + 'figures/lompe_dbdt/'
     savefile = savepath + str(t).replace(' ','_').replace(':','')
     lompe.lompeplot(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
     
@@ -287,13 +291,11 @@ dBu_new = np.zeros((Bu_org.shape[0], Bu_org.shape[1]-1))
 for i in range(dBu_org.shape[1]):
     dBu_org[:, i] = Bu_org[:, i+1] - Bu_org[:, i]
     dBu_new[:, i] = Bu_new[:, i+1] - Bu_new[:, i]
-#dBu_org = np.diff(Bu_org, axis=1)
-#dBu_new = np.diff(Bu_new, axis=1)
 
 vmax = np.max(abs(np.vstack((dBu_org, dBu_new))))
 vmax = np.max([vmax, np.max(abs(dBudt_pred))])
 
-clvls = 10**np.linspace(-vmax, vmax, 40)
+clvls = np.linspace(-vmax, vmax, 40)
 
 plt.ioff()
 for i in range(times.size-1):
@@ -301,170 +303,22 @@ for i in range(times.size-1):
     axs[0].contourf(grid.xi_mesh, grid.eta_mesh, dBu_org[:, i].reshape(grid.xi_mesh.shape), levels=clvls, cmap='bwr')
     axs[1].contourf(grid.xi_mesh, grid.eta_mesh, dBu_new[:, i].reshape(grid.xi_mesh.shape), levels=clvls, cmap='bwr')
     axs[2].contourf(grid.xi, grid.eta, dBudt_pred[:, :, i], levels=clvls, cmap='bwr')
-    plt.savefig('/scratch/BCSS-DAG Dropbox/Michael Madelaire/work/temp_storage/dBu_comp/{}.png'.format(i), bbox_inches='tight')
+    plt.savefig(path_out + 'figures/dBu_comp/{}.png'.format(i), bbox_inches='tight')
     plt.close('all')
 plt.ion()
 
 #%%
-'''
-#%%
-plt.ioff()
-
-conductance_functions = True
-
-event = '2012-04-05'
-savepath = '/scratch/BCSS-DAG Dropbox/Michael Madelaire/work/projects/lompe_induction_cheat/figures/'
-apex = apexpy.Apex(int(event[0:4]), refh = 110)
-
-supermagfn = '/scratch/BCSS-DAG Dropbox/Michael Madelaire/work/code/standard_lompe/lompe/examples/sample_dataset/20120405_supermag.h5'
-superdarnfn = '/scratch/BCSS-DAG Dropbox/Michael Madelaire/work/code/standard_lompe/lompe/examples/sample_dataset/20120405_superdarn_grdmap.h5'
-iridiumfn = '/scratch/BCSS-DAG Dropbox/Michael Madelaire/work/code/standard_lompe/lompe/examples/sample_dataset/20120405_iridium.h5'
-
-# set up grid
-position = (-90, 65) # lon, lat
-orientation = (-1, 2) # east, north
-L, W, Lres, Wres = 4200e3, 7000e3, 100.e3, 100.e3 # dimensions and resolution of grid
-grid = lompe.cs.CSgrid(lompe.cs.CSprojection(position, orientation), L, W, Lres, Wres, R = 6481.2e3)
-
-# load ampere, supermag, and superdarn data from 2012-05-05
-ampere    = pd.read_hdf(iridiumfn)
-supermag  = pd.read_hdf(supermagfn)
-superdarn = pd.read_hdf(superdarnfn)
-
-# these files contain entire day. Function to select from a smaller time interval is needed:
-def prepare_data(t0, t1):
-    """ get data from correct time period """
-    # prepare ampere
-    amp = ampere[(ampere.time >= t0) & (ampere.time <= t1)]
-    B = np.vstack((amp.B_e.values, amp.B_n.values, amp.B_r.values))
-    coords = np.vstack((amp.lon.values, amp.lat.values, amp.r.values))
-    amp_data = lompe.Data(B * 1e-9, coords, datatype = 'space_mag_fac', error = 30e-9, iweight=1.0)
-
-    # prepare supermag
-    sm = supermag[t0:t1]
-    B = np.vstack((sm.Be.values, sm.Bn.values, sm.Bu.values))
-    coords = np.vstack((sm.lon.values, sm.lat.values))
-    sm_data = lompe.Data(B * 1e-9, coords, datatype = 'ground_mag', error = 10e-9, iweight=0.4)
-
-    # prepare superdarn
-    sd = superdarn.loc[(superdarn.index >= t0) & (superdarn.index <= t1)]
-    vlos = sd['vlos'].values
-    coords = np.vstack((sd['glon'].values, sd['glat'].values))
-    los  = np.vstack((sd['le'].values, sd['ln'].values))
-    sd_data = lompe.Data(vlos, coordinates = coords, LOS = los, datatype = 'convection', error = 50, iweight=1.0)
-    
-    return amp_data, sm_data, sd_data
-
-# get figures from entire day and save somewhere
-
-# times during entire day
-times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min')
-DT = timedelta(seconds = 2 * 60) # will select data from +- DT
-
-
-Kp = 4 # for Hardy conductance model
-SH = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, times[0], 'hall'    )
-SP = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, times[0], 'pedersen')
-model = lompe.Emodel(grid, Hall_Pedersen_conductance = (SH, SP))
-
-
-    
-# loop through times and save
-for t in times[1:]:
-    print(t)
-    
-    SH = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'hall'    )
-    SP = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'pedersen')
-
-    model.clear_model(Hall_Pedersen_conductance = (SH, SP)) # reset
-    
-    amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
-    
-    model.add_data(amp_data, sm_data, sd_data)
-
-    gtg, ltl = model.run_inversion(l1 = 2, l2 = 0)
-    
-    savefile = savepath + str(t).replace(' ','_').replace(':','')
-    lompe.lompeplot(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
-
-#%% Only SECS
 
 plt.ioff()
+fig, axs = plt.subplots(4, 2, figsize=(10,15))
 
-conductance_functions = True
+for (ax, row, col) in zip(axs.flatten(),
+                          [12, 12, 24, 24, 36, 36, 48, 48],
+                          [12, 25, 12, 25, 12, 25, 12, 25]):
+    ax.plot(times[:-1], dBu_org[row*37+col, :]*1e9)
+    ax.plot(times[:-1], dBu_new[row*37+col, :]*1e9)
+    ax.plot(times[:-1], dBudt_pred[row, col, :]*1e9)
 
-event = '2012-04-05'
-savepath = '/scratch/BCSS-DAG Dropbox/Michael Madelaire/work/projects/lompe_induction_cheat/figures/'
-apex = apexpy.Apex(int(event[0:4]), refh = 110)
-
-supermagfn = '/scratch/BCSS-DAG Dropbox/Michael Madelaire/work/code/standard_lompe/lompe/examples/sample_dataset/20120405_supermag.h5'
-superdarnfn = '/scratch/BCSS-DAG Dropbox/Michael Madelaire/work/code/standard_lompe/lompe/examples/sample_dataset/20120405_superdarn_grdmap.h5'
-iridiumfn = '/scratch/BCSS-DAG Dropbox/Michael Madelaire/work/code/standard_lompe/lompe/examples/sample_dataset/20120405_iridium.h5'
-
-# set up grid
-position = (-90, 65) # lon, lat
-orientation = (-1, 2) # east, north
-L, W, Lres, Wres = 4200e3, 7000e3, 100.e3, 100.e3 # dimensions and resolution of grid
-grid = lompe.cs.CSgrid(lompe.cs.CSprojection(position, orientation), L, W, Lres, Wres, R = 6481.2e3)
-
-# load ampere, supermag, and superdarn data from 2012-05-05
-ampere    = pd.read_hdf(iridiumfn)
-supermag  = pd.read_hdf(supermagfn)
-superdarn = pd.read_hdf(superdarnfn)
-
-# these files contain entire day. Function to select from a smaller time interval is needed:
-def prepare_data(t0, t1):
-    """ get data from correct time period """
-    # prepare ampere
-    amp = ampere[(ampere.time >= t0) & (ampere.time <= t1)]
-    B = np.vstack((amp.B_e.values, amp.B_n.values, amp.B_r.values))
-    coords = np.vstack((amp.lon.values, amp.lat.values, amp.r.values))
-    amp_data = lompe.Data(B * 1e-9, coords, datatype = 'space_mag_fac', error = 30e-9, iweight=1.0)
-
-    # prepare supermag
-    sm = supermag[t0:t1]
-    B = np.vstack((sm.Be.values, sm.Bn.values, sm.Bu.values))
-    coords = np.vstack((sm.lon.values, sm.lat.values))
-    sm_data = lompe.Data(B * 1e-9, coords, datatype = 'ground_mag', error = 10e-9, iweight=0.4)
-
-    # prepare superdarn
-    sd = superdarn.loc[(superdarn.index >= t0) & (superdarn.index <= t1)]
-    vlos = sd['vlos'].values
-    coords = np.vstack((sd['glon'].values, sd['glat'].values))
-    los  = np.vstack((sd['le'].values, sd['ln'].values))
-    sd_data = lompe.Data(vlos, coordinates = coords, LOS = los, datatype = 'convection', error = 50, iweight=1.0)
-    
-    return amp_data, sm_data, sd_data
-
-# get figures from entire day and save somewhere
-
-# times during entire day
-times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min')
-DT = timedelta(seconds = 2 * 60) # will select data from +- DT
-
-
-Kp = 4 # for Hardy conductance model
-SH = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, times[0], 'hall'    )
-SP = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, times[0], 'pedersen')
-model = lompe.Emodel(grid, Hall_Pedersen_conductance = (SH, SP))
-
-
-    
-# loop through times and save
-for t in times[1:]:
-    print(t)
-    
-    SH = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'hall'    )
-    SP = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'pedersen')
-
-    model.clear_model(Hall_Pedersen_conductance = (SH, SP)) # reset
-    
-    amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
-    
-    model.add_data(amp_data, sm_data, sd_data)
-
-    gtg, ltl = model.run_inversion(l1 = 2, l2 = 0)
-    
-    savefile = savepath + str(t).replace(' ','_').replace(':','')
-    lompe.lompeplot(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
-'''
+plt.savefig(path_out + 'figures/time_series_comparison.png', bbox_inches='tight')
+plt.close('all')
+plt.ion()
