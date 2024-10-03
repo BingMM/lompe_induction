@@ -74,7 +74,7 @@ ampere    = pd.read_hdf(iridiumfn)
 supermag  = pd.read_hdf(supermagfn)
 superdarn = pd.read_hdf(superdarnfn)
 
-times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min')[:20] # Limiting testing to the first 100, instead of all 480 times
+times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min') # Limiting testing to the first 100, instead of all 480 times
 DT    = timedelta(seconds = 2 * 60) # will select data from +- DT
 
 #%% Define grid
