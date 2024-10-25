@@ -1,5 +1,6 @@
 #%% Import
 
+import gc
 import numpy as np
 import pandas as pd
 from datetime import timedelta
@@ -10,6 +11,12 @@ import lompe
 import scipy
 from secsy import get_SECS_B_G_matrices, get_SECS_J_G_matrices
 from tqdm import tqdm
+import cupy as cp
+#from cupyx.scipy.linalg import block_diag
+from cupyx.scipy.sparse import diags, csr_matrix, coo_matrix, issparse, dia_matrix, hstack, vstack, bmat
+from cupyx.scipy.sparse.linalg import spsolve
+import pickle
+import time
 
 #%% Steps 
 
@@ -57,10 +64,123 @@ def prepare_data(t0, t1):
     
     return amp_data, sm_data, sd_data
 
+def clean():
+    cp.get_default_memory_pool().free_all_blocks()
+    cp.cuda.Device().synchronize()
+    gc.collect()
+
+def np_list_2_cp(matrix_list, do_sparse=False):
+    if do_sparse:
+        cp_list = [coo_matrix(cp.array(k)) for k in matrix_list]
+    else:
+        cp_list = [cp.array(k) for k in matrix_list]
+    return cp_list
+
+def chunking(A, B, chunk_size = 1):
+    
+    # Initialize result matrix
+    AB_shape = (A.shape[0], B.shape[1])
+    AB = cp.zeros(AB_shape, dtype=A.dtype)
+    
+    if isinstance(B, dia_matrix):
+        B = B.tocsr()        
+    
+    # Process each chunk
+    num_chunks = (B.shape[1] + chunk_size - 1) // chunk_size
+    
+    for k in range(num_chunks):
+        #print(k)
+        start_index = k * chunk_size
+        end_index = min(start_index + chunk_size, B.shape[1])
+        
+        # Slice chunk from B
+        clean()
+        B_chunk = B[:, start_index:end_index]
+        if isinstance(B_chunk, csr_matrix):
+            B_chunk = B_chunk.toarray()
+        
+        # Compute partial result using the chunk
+        clean()
+        AB_partial = A.dot(B_chunk)
+        del B_chunk
+        
+        # Aggregate the result
+        clean()
+        AB[:, start_index:end_index] = AB_partial
+        del AB_partial
+    
+    return AB
+
+def matrix_sparsity(dense_matrix):
+    # Number of zero elements
+    zero_elements = cp.count_nonzero(dense_matrix == 0)
+    # Total number of elements
+    total_elements = dense_matrix.size
+    # Sparsity ratio
+    sparsity = zero_elements / total_elements
+    return sparsity
+
+def manual_block_diag(matrices):
+    """Construct block diagonal matrix from a list of sparse matrices."""
+    rows = []
+    col_offset = 0
+
+    for matrix in matrices:
+        row_blocks = []
+        # Create leading zero blocks for current row
+        if col_offset > 0:
+            row_blocks.append(coo_matrix((matrix.shape[0], col_offset)))
+
+        # Add the current matrix
+        row_blocks.append(matrix)
+
+        # Create trailing zero blocks for the row
+        remaining_cols = sum(m.shape[1] for m in matrices) - col_offset - matrix.shape[1]
+        if remaining_cols > 0:
+            row_blocks.append(coo_matrix((matrix.shape[0], remaining_cols)))
+
+        # Horizontal stack of the row blocks
+        rows.append(hstack(row_blocks))
+
+        # Update the column offset for the next block
+        col_offset += matrix.shape[1]
+
+    # Vertical stack of all rows to form block diagonal matrix
+    return vstack(rows)
+
+def build_sparse_matrix(D):
+    num_blocks = len(D)
+    
+    # Create a zero-filled sparse matrix just for format consistency (size will be adjusted)
+    zero_shape = (D[0].shape[0], D[0].shape[1])
+    zero_matrix = coo_matrix(zero_shape, dtype=D[0].dtype)
+    
+    # Initialize list of lists to store submatrices
+    blocks = []
+    
+    for i in range(num_blocks-1):
+        row_blocks = []
+        for j in range(num_blocks):
+            if j == i:
+                if i % 2 == 0:
+                    row_blocks.append(-D[i])
+                else:
+                    row_blocks.append(zero_matrix)
+            elif j == i + 1:
+                row_blocks.append(D[i + 1])
+            else:
+                row_blocks.append(zero_matrix)
+        blocks.append(row_blocks)
+    
+    # Construct block matrix
+    C_coo = bmat(blocks, format='coo')
+    
+    return C_coo
+
 #%% Paths
 
-path_in  = '/home/bing/BCSS-DAG Dropbox/Michael Madelaire/work/code/standard_lompe/lompe/examples/sample_dataset/'
-path_out = '/home/bing/BCSS-DAG Dropbox/Michael Madelaire/work/code/repos/lompe_induction/'
+path_in  = '/home/bing/Dropbox/work/code/standard_lompe/lompe/examples/sample_dataset/'
+path_out = '/home/bing/Dropbox/work/code/repos/lompe_induction/'
 
 #%% Load data
 
@@ -117,8 +237,15 @@ for i, t in tqdm(enumerate(times), total=len(times)):
     GTd = G.T.dot(d)
     gtgmag = np.median(abs(np.diag(GTG)))
     
-    m = np.linalg.solve(GTG + 5e0*gtgmag*np.eye(GTG.shape[0]), GTd)
+    if True:
+        m = cp.linalg.solve(cp.array(GTG + 5e0*gtgmag*np.eye(GTG.shape[0])), cp.array(GTd))
+        m = cp.asnumpy(m)
+    else:
+        m = np.linalg.solve(GTG + 5e0*gtgmag*np.eye(GTG.shape[0]), GTd)
+    
     SECS_ms[i] = m
+    
+    clean()
     
     Bu_pred[:, :, i] = Gu_pred.dot(m).reshape(grid.shape)
 
@@ -185,20 +312,208 @@ for i, t in tqdm(enumerate(times), total=times.size):
     
     amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
     model.add_data(amp_data, sm_data, sd_data)
-    gtg, ltl = model.run_inversion(l1 = 2, l2 = 0, save_matrices=True)
+    gtg, ltl = model.run_inversion(l1 = 2, l2 = 0, save_matrices=True, use_gpu=True)
     
-    GsBu.append(model._B_df_matrix(grid.lat.flatten(), grid.lon.flatten(), 6371.2*1e3)[2*grid.size:, :])
+    GsBu.append(model._B_df_matrix(grid.lat.flatten(), grid.lon.flatten(), 6371.2*1e3)[2*grid.size:, :].astype(np.float32))
 
-    Gs.append(model._G)
-    ws.append(model._w)
-    ds.append(model._d)
+    Gs.append(model._G.astype(np.float32))
+    ws.append(model._w.astype(np.float32))
+    ds.append(model._d.astype(np.float32))
 
-#%% Step 3: E induction
+clean()
+
+#%% Step 3: E induction - CUPY - asyncrounous testbed
+
+stream = cp.cuda.Stream()
 
 w_size = 3
 ms = np.zeros((grid.xi_mesh.size, times.size))
 
+clean()
+
+dtiter = []
 for i, t in tqdm(enumerate(times), total=times.size):
+    
+    t0 = time.time()
+    
+    j_mid = w_size + 0 # The window is 2*w_size+1 wide.
+    
+    i_start = i - w_size # The first timestep 
+    i_stop = i + w_size # The last timestep
+    
+    # Ensure first timestep cannot be smaller than 0
+    if i_start < 0:
+        j_mid += i_start # If, e.g., -1 set to 0 and move j_mid down by 1.
+        i_start = 0
+    
+    # Ensure last timestep does not exceed times.size-1.
+    if i_stop > (times.size-1):
+        j_mid -= i_stop - times.size-1 # If, e.g., 2 over max set to max and move j_mid down by 2.
+        i_stop = times.size-1 # 1 is added later as last index is exclusive. Silly Python.
+    
+    nt = i_stop-i_start+1 # Number of timesteps included in this window
+        
+    with stream:
+        # Generate matrices - Steady state
+        G_ss = manual_block_diag(np_list_2_cp(Gs[i_start:i_stop+1], do_sparse=True))    
+        d_ss = hstack(np_list_2_cp(ds[i_start:i_stop+1], do_sparse=True))
+        w_ss = hstack(np_list_2_cp(ws[i_start:i_stop+1], do_sparse=True))
+        # Generate matrices - Temporal
+        G_t = build_sparse_matrix(np_list_2_cp(GsBu[i_start:i_stop+1], do_sparse=True))
+        d_t = coo_matrix(cp.array(dBudt_pred[:, :, i_start:i_stop].flatten()))    
+        w_t = coo_matrix(cp.ones(d_t.size) / (1*1e-9)**2)
+    clean()
+        
+    with stream:
+        # Combine matrices
+        G = vstack((G_ss, G_t))
+        d = hstack([d_ss, d_t])
+        w = hstack([w_ss, w_t])
+        # Prepare to solve the problem
+        G = G.tocsr()
+        d = d.tocsr().reshape(-1, 1)
+        w = diags(w.toarray().flatten())
+    del G_ss, G_t, d_ss, d_t, w_ss, w_t
+    clean()
+
+    # Solve inverse problem
+    with stream:
+        GTW = G.T.dot(w)
+    del w
+    clean()
+    
+    with stream:
+        GTWG = csr_matrix(chunking(GTW, G, chunk_size=3000))
+        gtgmag = cp.median(abs(GTWG.diagonal()))
+        GTWG += 2e0*gtgmag*csr_matrix(cp.eye(GTWG.shape[0]))
+        GTd = GTW.dot(d)
+        GTd = GTd.todense()
+    del G, GTW, d
+    clean()
+    
+    with stream:
+        m = spsolve(GTWG, GTd)
+    del GTWG, GTd
+    clean()
+    
+    m = cp.asnumpy(m)    
+    ms[:, i] = m.reshape((nt, grid.xi_mesh.size)).T[:, j_mid]
+    
+    t1 = time.time()
+    dtiter.append(t1-t0)
+
+#%% Step 3: E induction - CUPY
+'''
+w_size = 3
+ms = np.zeros((grid.xi_mesh.size, times.size))
+
+clean()
+
+for i, t in tqdm(enumerate(times), total=times.size):
+    
+    j_mid = w_size + 0 # The window is 2*w_size+1 wide.
+    
+    i_start = i - w_size # The first timestep 
+    i_stop = i + w_size # The last timestep
+    
+    # Ensure first timestep cannot be smaller than 0
+    if i_start < 0:
+        j_mid += i_start # If, e.g., -1 set to 0 and move j_mid down by 1.
+        i_start = 0
+    
+    # Ensure last timestep does not exceed times.size-1.
+    if i_stop > (times.size-1):
+        j_mid -= i_stop - times.size-1 # If, e.g., 2 over max set to max and move j_mid down by 2.
+        i_stop = times.size-1 # 1 is added later as last index is exclusive. Silly Python.
+    
+    nt = i_stop-i_start+1 # Number of timesteps included in this window
+        
+    # Generate matrices - Steady state
+    G_ss = manual_block_diag(np_list_2_cp(Gs[i_start:i_stop+1], do_sparse=True))    
+    clean()
+    d_ss = hstack(np_list_2_cp(ds[i_start:i_stop+1], do_sparse=True))
+    w_ss = hstack(np_list_2_cp(ws[i_start:i_stop+1], do_sparse=True))
+    clean()
+
+    # Generate matrices - Temporal
+    G_t = build_sparse_matrix(np_list_2_cp(GsBu[i_start:i_stop+1], do_sparse=True))
+    clean()
+    d_t = coo_matrix(cp.array(dBudt_pred[:, :, i_start:i_stop].flatten()))    
+    w_t = coo_matrix(cp.ones(d_t.size) / (1*1e-9)**2)
+    clean()
+    
+    # Combine matrices
+    G = vstack((G_ss, G_t))
+    del G_ss, G_t
+    clean()
+    
+    d = hstack([d_ss, d_t])
+    del d_ss, d_t
+    clean()
+        
+    w = hstack([w_ss, w_t])
+    del w_ss, w_t
+    clean()
+
+    # Prepare to solve the problem
+    G = G.tocsr()
+    clean()
+    d = d.tocsr().reshape(-1, 1)
+    clean()
+    w = diags(w.toarray().flatten())
+    clean()
+
+    # Solve inverse problem
+    GTW = G.T.dot(w)
+    del w
+    clean()
+    
+    GTWG = csr_matrix(chunking(GTW, G, chunk_size=3000))
+    #GTWG = chunking(GTW, G, chunk_size=3000)
+    del G
+    clean()
+    
+    GTd = GTW.dot(d)
+    del GTW, d
+    clean()
+    
+    #gtgmag = cp.median(abs(cp.diag(GTWG)))
+    gtgmag = cp.median(abs(GTWG.diagonal()))
+    clean()
+
+    #GTWG += 2e0*gtgmag*cp.eye(GTWG.shape[0])
+    GTWG += 2e0*gtgmag*csr_matrix(cp.eye(GTWG.shape[0]))
+    clean()
+    
+    GTd = GTd.todense()
+    clean()
+    
+    m = spsolve(GTWG, GTd)
+    del GTWG, GTd
+    clean()
+    
+    m = cp.asnumpy(m)    
+    ms[:, i] = m.reshape((nt, grid.xi_mesh.size)).T[:, j_mid]
+'''
+#%% Save model in pickle format
+
+with open('/home/bing/Dropbox//work/code/repos/lompe_induction/data/window_smoother_model.pkl', 'wb') as f:
+    pickle.dump(ms, f)
+
+#%% Load model for speed-up
+
+with open('/home/bing/Dropbox//work/code/repos/lompe_induction/data/window_smoother_model.pkl', 'rb') as f:
+    ms = pickle.load(f)
+
+#%% Step 3: E induction
+'''
+w_size = 3
+ms = np.zeros((grid.xi_mesh.size, times.size))
+
+dtiter_cpu = []
+for i, t in tqdm(enumerate(times), total=times.size):
+    
+    t0 = time.time()
     
     j_mid = w_size + 0 # The window is 2*w_size+1 wide.
     
@@ -237,14 +552,53 @@ for i, t in tqdm(enumerate(times), total=times.size):
     w = np.hstack((w_ss, w_t))
 
     # Solve inverse problem
-    GTG = G.T.dot(np.diag(w)).dot(G)
-    GTd = G.T.dot(np.diag(w)).dot(d)
+    GT = G.T.dot(np.diag(w))
+    GTG = GT.dot(G)
+    GTd = GT.dot(d)
 
     gtgmag = np.median(abs(np.diag(GTG)))
 
     m = scipy.linalg.solve(GTG + 2e0*gtgmag*np.eye(GTG.shape[0]), GTd)
+    #m = scipy.linalg.lstsq(GTG + 2e0*gtgmag*np.eye(GTG.shape[0]), GTd, lapack_driver='gelsy')[0]    
+    #solve_least_squares(GTG + 2e0*gtgmag*np.eye(GTG.shape[0]), GTd)
+    #m = cp.linalg.solve(cp.array(GTG + 2e0*gtgmag*np.eye(GTG.shape[0])), cp.array(GTd))
+    #m = cp.asnumpy(m)
+    
     ms[:, i] = m.reshape((nt, grid.xi_mesh.size)).T[:, j_mid]
     
+    t1 = time.time()
+    dtiter_cpu.append(t1-t0)
+'''    
+#%%
+'''
+plt.ioff()
+fig, axs = plt.subplots(1, 2, figsize=(15,9))
+
+axs[0].plot(np.arange(1, 21), dtiter_cpu, label='CPU', linewidth=5)
+axs[0].plot(np.arange(1, 21), dtiter, label='GPU', linewidth=5)
+
+axs[1].plot(np.arange(1, 21), np.cumsum(dtiter_cpu)/60, linewidth=5)
+axs[1].plot(np.arange(1, 21), np.cumsum(dtiter)/60, linewidth=5)
+
+axs[0].legend(fontsize=20)
+
+for ax in axs:
+    ax.set_xlabel('Iteration', fontsize=18)
+    ax.set_xticklabels(ax.get_xticklabels(), fontsize=14)
+    ax.set_yticklabels(ax.get_yticklabels(), fontsize=14)
+
+axs[0].set_ylabel('Seconds', fontsize=18)
+axs[1].set_ylabel('Minutes', fontsize=18)
+
+
+
+axs[0].text(.5, 1.05, 'Time per iteration', ha='center', va='center', transform=axs[0].transAxes, fontsize=20)
+axs[1].text(.5, 1.05, 'Total time', ha='center', va='center', transform=axs[1].transAxes, fontsize=20)
+
+plt.savefig('/home/bing/Dropbox/work/code/repos/lompe_induction/figures/comparison.png', bbox_inches='tight')
+plt.close('all')
+plt.ion()
+'''
 #%% Step 4: Visualization
 
 Bu_org = np.zeros((grid.xi_mesh.size, times.size))
@@ -252,7 +606,7 @@ Bu_new = np.zeros((grid.xi_mesh.size, times.size))
 
 apex = apexpy.Apex(2012, refh = 110)
 plt.ioff()
-for i, t in tqdm(enumerate(times)):
+for i, t in tqdm(enumerate(times), total=times.size):
     
     SH = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'hall'    )
     SP = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'pedersen')
@@ -264,7 +618,7 @@ for i, t in tqdm(enumerate(times)):
     
     amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
     model.add_data(amp_data, sm_data, sd_data)
-    gtg, ltl = model.run_inversion(l1 = 2, l2 = 0)
+    gtg, ltl = model.run_inversion(l1 = 2, l2 = 0, use_gpu=True)
 
     savepath = path_out + 'figures/lompe/'
     savefile = savepath + str(t).replace(' ','_').replace(':','')
@@ -318,6 +672,8 @@ for (ax, row, col) in zip(axs.flatten(),
     ax.plot(times[:-1], dBu_org[row*37+col, :]*1e9)
     ax.plot(times[:-1], dBu_new[row*37+col, :]*1e9)
     ax.plot(times[:-1], dBudt_pred[row, col, :]*1e9)
+
+    #ax.set_xlim([times[0], times[20]])
 
 plt.savefig(path_out + 'figures/time_series_comparison.png', bbox_inches='tight')
 plt.close('all')
