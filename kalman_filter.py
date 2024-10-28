@@ -91,51 +91,141 @@ s_limit = np.min([grid.Wres, grid.Lres])/2
 
 Kp = 4 # for Hardy conductance model
 
-#%% Step 1: Prepare constant matrices
+#%% Step 1: Prepare constant matrices - General
 
+# Time
 nt = times.size
 dt = 3*60
 
-## Preparation for the measurement function
 # Define conductance functions to be called in loop and set-up Lompe model
-SH = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'hall')
-SP = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'pedersen')
+SH_fun = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'hall')
+SP_fun = lambda lon = grid.lon, lat = grid.lat: hardy_EUV(lon, lat, 5, t, 'pedersen')
 
 # Set-up lompe model for EZ access to various matrices
-model = lompe.Emodel(grid, Hall_Pedersen_conductance = (SH, SP))
+model = lompe.Emodel(grid, Hall_Pedersen_conductance = (SH_fun, SP_fun))
 
-# DF SECS design matrix for Br at ionosphere
-_, _, Hu = get_SECS_B_G_matrices(grid.lat.flatten(), grid.lon.flatten(), model.R, 
-                                 grid.lat_mesh.flatten(), grid.lon_mesh.flatten(),
+# Model dimensions
+n_CF    = grid.xi_mesh.size # Number of model parameters describing Epot
+n_DF    = grid.xi_mesh.size # Number of model parameters describing Eind
+n       = n_CF + n_DF
+
+#%% Step 1: Prepare Dynamic model function (DF)
+
+A_DF = np.hstack((np.zeros((n_DF, n_CF)), np.eye(n_DF)))
+
+#%% Step 1: Prepare Dynamic model function (CF)
+
+# Br from CF E
+## DF SECS design matrix for Br at ionosphere
+_, _, Hu = get_SECS_B_G_matrices(grid.lat_mesh.flatten(), grid.lon_mesh.flatten(), model.R, 
+                                 grid.lat.flatten(), grid.lon.flatten(),
                                  current_type = 'divergence_free',
                                  RI = model.R,
                                  singularity_limit = model.secs_singularity_limit)
 
-# Extract and combine various information that remains constant and is required to construct design matrix linking Epot to Br.
-hemisphere = 1
-HQiA_u = Hu @ model.QiA
+## QA 
+QiA = model.QiA
+
+## HQiA
+HQiA_u = Hu @ QiA
+
+## c_J necessary pieces
+'''
+c_J_CF =    - self.Dn.dot(SP) * Ee + self.De.dot(SP) * En \
+            - self.Dn.dot(SH) * En * self.hemisphere \
+            - self.De.dot(SH) * Ee * self.hemisphere \
+            - SH * self.Ddiv.dot(E) * self.hemisphere
+'''
+hemisphere = model.hemisphere
 Ee, En = model.Ee, model.En
 E = np.vstack((Ee, En))
 Dn = model.Dn
 De = model.De
 Ddiv = model.Ddiv
+DdivdotE = Ddiv.dot(E)
 
+def calc_G_r_CF(SH, SP):
+    c_J_CF = - Dn.dot(SP) * Ee + De.dot(SP) * En \
+             - Dn.dot(SH) * En * hemisphere - De.dot(SH) * Ee * hemisphere \
+             - SH * DdivdotE * hemisphere
+    G_r_CF = HQiA_u.dot(c_J_CF)
+    return G_r_CF
 
+# dB/dt from DF E
+_, _, A_E = model.grid_E.projection.differentials(model.grid_E.xi, model.grid_E.eta,
+                                                  model.grid_E.dxi, model.grid_E.deta, R=model.R)
+A_E = np.diag(np.ravel(A_E))
+Q_E = np.eye(model.grid_E.size) - A_E.dot(np.full((model.grid_E.size, model.grid_E.size), 1 / (4 * np.pi * model.R**2)))
+c_E = -dt * np.linalg.inv(A_E) @ Q_E
+
+'''
+c_E = np.diag(-dt * np.linalg.inv(model.A) @ model.Q)
+RBF = scipy.interpolate.Rbf(grid.xi.flatten(), grid.eta.flatten(), c_E)
+c_E = RBF(grid.xi_mesh.flatten(), grid.eta_mesh.flatten())
+c_E = np.diag(c_E)
+'''
+
+# T (model variance)    
+def calc_T(G_r_CF, C_i):
+    T =   G_r_CF @ C_i[:n_CF, :n_CF] @ G_r_CF.T \
+        + c_E @ C_i[n_CF:, n_CF:] @ c_E.T
+    return T
+
+def calc_dmf_CF(SH, SP, C_i):
+    G_r_CF  = calc_G_r_CF(SH, SP)
+    T       = calc_T(G_r_CF, C_i)
+    T       = np.eye(T.shape[0])
+    T_inv   = np.linalg.pinv(T)
+    del T
+    
+    GTT     = G_r_CF.T @ T_inv
+    del T_inv
+
+    GTTG    = GTT @ G_r_CF
+    del G_r_CF
+    
+    GTTcE   = GTT @ c_E
+    del GTT
+    
+    gtgmag = np.median(np.diag(GTTG))
+    #A_CF = np.linalg.solve(GTTG + 2*gtgmag*np.eye(GTTG.shape[0]), np.hstack((GTTG, GTTcE)))
+    A_CF = np.linalg.solve(GTTG, np.hstack((GTTG, GTTcE)))
+    #A_CF = np.linalg.lstsq(GTTG + 1e-2*gtgmag*np.eye(GTTG.shape[0]), np.hstack((GTTG, GTTcE)), rcond=None)[0]
+    #A_CF = np.linalg.lstsq(GTTG + 1e0*gtgmag*np.eye(GTTG.shape[0]), np.hstack((GTTG, GTTcE)), rcond=None)[0]
+    #A_CF = np.linalg.lstsq(GTTG + 1e1*gtgmag*np.eye(GTTG.shape[0]), np.hstack((GTTG, GTTcE)), rcond=None)[0]
+    del GTTG, GTTcE
+    
+    return A_CF
+
+#%% Step 1: Prepare Dynamic model function
+
+def calc_dmf(SH, SP, C_i):
+    A_CF = calc_dmf_CF(SH, SP, C_i)
+    A = np.vstack((A_CF, A_DF))
+    return A
 
 #%% Step 2: Initial conditions
 
-n_CF    = 2*grid.xi_mesh.size # Number of model parameters describing Epot
-n_DF    = 2*grid.xi_mesh.size # Number of model parameters describing Eind
-n       = n_CF + n_DF
+i = 0
+t = times[0]
+model.clear_model(Hall_Pedersen_conductance = (SH_fun, SP_fun)) # reset
+amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
+model.add_data(amp_data, sm_data, sd_data)
+gtg, ltl = model.run_inversion(l1 = 2, l2 = 0, save_matrices=True)
+
+#with open(path_out + '/data/standard_lompe_model_vectors.pkl', 'rb') as f:
+#    ms_standard = pickle.load(f)
 
 # Initial guess - Mean
-m0_CF   = np.zeros(n_CF) # Initial model of Epot
+#m0_CF   = np.zeros(n_CF) # Initial model of Epot
+m0_CF   = model.m + 0 # Initial model of Epot
 m0_DF   = np.zeros(n_DF) # Initial model of Eind
 m0     = np.hstack((m0_CF, m0_DF)) # Mean of prior distribution
 
 # Initial guess - Covariance
-C0_CF   = 1000**2 * np.diag(np.ones(n_CF)) # Covariance associated with m0_CF
-C0_DF   = 1000**2 * np.diag(np.ones(n_DF)) # Covariance associated with m0_DF
+#C0_CF   = 1000**2 * np.diag(np.ones(n_CF)) # Covariance associated with m0_CF
+C0_CF   = model.Cmpost + 0 # Covariance associated with m0_CF
+C0_DF   = 500**2 * np.diag(np.ones(n_DF)) # Covariance associated with m0_DF
 C0_CFDF = np.zeros((n_DF, n_CF)) # Covariance between m0_CF and m0_DF
 C0      = np.vstack((np.hstack((C0_CF  , C0_CFDF.T)),
                      np.hstack((C0_CFDF, C0_DF    )) ))
@@ -143,48 +233,39 @@ C0      = np.vstack((np.hstack((C0_CF  , C0_CFDF.T)),
 #%% Step 3: Run Kalman filter
 
 ms = np.zeros((n, nt))
+rs = []
 Cs = np.zeros((n, n, nt))
 
 m_o = m0 # Old model (k-1)
 C_o = C0 # Old covariance (k-1)
 
-for i, t in tqdm(enumerate(times), total=nt):
+for i, t in tqdm(enumerate(times[:6]), total=nt):
 
     ## Prepatation
-    # Define model function - CF part
-    SH = hardy_EUV(grid.lon, grid.lat, 5, t, 'hall').reshape(-1, 1)
-    SP = hardy_EUV(grid.lon, grid.lat, 5, t, 'pedersen').reshape(-1, 1)
-
-    c = - Dn @ SP * Ee + De @ SP * En \
-        - Dn @ SH * En * hemisphere \
-        - De @ SH * Ee * hemisphere \
-        - SH * Ddiv @ E * hemisphere
-
-    Gu = HQiA_u @ c    
-    
-    Ck = Gu @ C_o[0:n_CF, 0:n_CF] @ Gu.T + (dt * c_E) @ C_o[n_CF:, n_CF:] @ (dt * c_E).T
-        
-    GTG = Gu.T @ Ck @ Gu
-    GTG_Gc = np.hstack(GTG, -Gu.T @ Ck @ c)
-    
-    Q_CF = np.linalg.solve(GTG, GTG_Gc)
-    
-    # Define model function - DF part
-    Q_DF = np.hstack((np.zeros((n_CF, n_CF)), np.eye(n_DF)))
-    
     # Define model function
-    A = np.vstack((Q_CF, Q_DF))
+    SH = SH_fun().reshape(-1, 1)
+    SP = SP_fun().reshape(-1, 1)
 
-    # Define process noise
-    Q = .1 * np.diag(np.diag(C_o))
+    A = calc_dmf(SH, SP, C_o)
 
-    # Define measurement function
-    H = 
-
-    # Get data
-    d, R   = get_data() # Get measurements and uncertainty at k
+    # Define measurement function    
+    model.clear_model(Hall_Pedersen_conductance = (SH_fun, SP_fun)) # reset
+    amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
+    #model.add_data(amp_data, sm_data, sd_data)
+    model.add_data(amp_data, sm_data)
+    model.get_G_CF()
+    model.get_G_DF()
+    
+    d = model._d
     nd = d.size
-
+    #R = np.diag(1/model._w)
+    R = model._Cd
+    H = np.hstack((model.G_CF, model.G_DF))
+    
+    # Define process noise
+    #Q = .1 * np.diag(np.diag(C_o))
+    Q = .5 * C_o
+    
     ## Prediction
     m_p = A @ m_o             # Prediction of current model (k)
     C_p = A @ C_o @ A.T + Q   # Prediction of current model covariance (k)
@@ -192,8 +273,9 @@ for i, t in tqdm(enumerate(times), total=nt):
     ## Update
     # Calculate various things
     r_p         = d - H @ m_p                       # Calculate residual between data and predictions
-    Cd_p        = H @ C_p @ H.T + R                 # Project predicted model covariance into data and add measurment noise
-    Cd_p_inv    = np.linalg.solve(Cd_p, np.eye(nd)) # Inverse, needed below
+    Cd_p        = H @ C_p @ H.T + np.diag(R)                 # Project predicted model covariance into data and add measurment noise
+    Cd_p_inv    = np.linalg.pinv(Cd_p) # Inverse, needed below
+    #Cd_p_inv    = 1/Cd_p # Inverse, needed below
     K           = C_p @ H.T @ Cd_p_inv              # Kalman gain
     
     # Actual update
@@ -202,7 +284,38 @@ for i, t in tqdm(enumerate(times), total=nt):
         
     # Store filtered models
     ms[:, i] = m_c
-    Cs[:, :, i] = C_c        
+    Cs[:, :, i] = C_c
+    #rs = H @ m_c
+
+#%%
+
+fig, axs = plt.subplots(3,2, sharey=True)
+axs = axs.flatten()
+axs[0].plot(m0[:n_CF])
+axr = plt.twinx(axs[0])
+axr.plot(m0[n_CF:], color='tab:orange')
+for j in range(1,6):
+    axs[j].plot(ms[:, j-1][:n_CF])
+    axr = plt.twinx(axs[j])
+    axr.plot(ms[:, j-1][n_CF:], color='tab:orange')
+
+#%%
+plt.ioff()
+apex = apexpy.Apex(2012, refh = 110)
+savepath = path_out + 'figures/kalman_lompe/'
+
+model.m = m0[:n_CF]
+#model.m = (A @ m_o)[:n_CF]
+savefile = savepath + 'init'
+lompe.lompeplot(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
+plt.close('all')
+
+for i, t in tqdm(enumerate(times[:6]), total=nt):
+    model.m = ms[:n_CF, i]
+    savefile = savepath + str(t).replace(' ','_').replace(':','')
+    lompe.lompeplot(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
+    plt.close('all')
+plt.ion()
 
 #%% Step 4: Save filtered models
 
