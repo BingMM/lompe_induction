@@ -76,7 +76,7 @@ ampere    = pd.read_hdf(iridiumfn)
 supermag  = pd.read_hdf(supermagfn)
 superdarn = pd.read_hdf(superdarnfn)
 
-times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min')[:50] # Limiting testing to the first 100, instead of all 480 times
+times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min')[:100] # Limiting testing to the first 100, instead of all 480 times
 DT    = timedelta(seconds = 2 * 60) # will select data from +- DT
 
 #%% Define grid
@@ -122,6 +122,34 @@ A_DF = np.hstack((A_CFDF, A_DFDF))
 A_CFCF = np.eye(n_CF)
 
 # Br from CF E
+## Include temporal shift
+#lon_shift = grid.lon.flatten() + (360/24/60*3)
+#lon_shift[lon_shift>180] -= 360
+lon_shift = grid.lon_mesh.flatten() + (360/24/60*3)
+lon_shift[lon_shift>180] -= 360
+xi_shift, eta_shift = grid.projection.geo2cube(lon_shift.reshape(grid.xi_mesh.shape), grid.lat_mesh)
+
+Q_shift = np.zeros((grid.xi_mesh.size, grid.xi_mesh.size))
+
+for row in range(grid.xi_mesh.shape[0]):
+    for col in range(grid.xi_mesh.shape[1]):
+        row_i = np.argmin(abs(grid.eta_mesh[:, 0]-eta_shift[row, col]))
+        col_i = np.argmin(abs(grid.xi_mesh[0, :]-xi_shift[row, col]))
+        
+        Q_shift[row*grid.xi_mesh.shape[1]+col, row_i*grid.xi_mesh.shape[1]+col_i] = 1
+
+#A = np.random.normal(0, 10, (grid.xi_mesh.shape))
+#A = np.arange(grid.xi_mesh.size).reshape(grid.xi_mesh.shape)
+#A_prime = (Q_shift @ A.flatten()).reshape(grid.xi_mesh.shape)
+
+#vmax = np.max(abs(np.vstack((A, A_prime))))
+#clvls=np.linspace(-vmax, vmax, 40)
+#fig, axs = plt.subplots(1, 2)
+#axs[0].tricontourf(grid.xi_mesh.flatten(), grid.eta_mesh.flatten(), A.flatten(), levels=clvls, cmap='bwr')
+#axs[1].tricontourf(xi_shift.flatten(), eta_shift.flatten(), A_prime.flatten(), levels=clvls, cmap='bwr')
+#axs[0].imshow(A)
+#axs[1].imshow(A_prime)
+
 ## DF SECS design matrix for Br at ionosphere
 _, _, Hu = get_SECS_B_G_matrices(grid.lat_mesh.flatten(), grid.lon_mesh.flatten(), model.R, 
                                  grid.lat.flatten(), grid.lon.flatten(),
@@ -129,11 +157,18 @@ _, _, Hu = get_SECS_B_G_matrices(grid.lat_mesh.flatten(), grid.lon_mesh.flatten(
                                  RI = model.R,
                                  singularity_limit = model.secs_singularity_limit)
 
+_, _, Hu_t = get_SECS_B_G_matrices(grid.lat_mesh.flatten(), lon_shift, model.R, 
+                                   grid.lat.flatten(), grid.lon.flatten(),
+                                   current_type = 'divergence_free',
+                                   RI = model.R,
+                                   singularity_limit = model.secs_singularity_limit)
+
 ## QA 
 QiA = model.QiA
 
 ## HQiA
-HQiA_u = Hu @ QiA
+HQiA_u   = Hu @ QiA
+HQiA_u_t = Hu_t @ QiA
 
 ## c_J necessary pieces
 '''
@@ -150,11 +185,14 @@ De = model.De
 Ddiv = model.Ddiv
 DdivdotE = Ddiv.dot(E)
 
-def calc_G_r_CF(SH, SP):
+def calc_G_r_CF(SH, SP, t_shift=False):
     c_J_CF = - Dn.dot(SP) * Ee + De.dot(SP) * En \
              - Dn.dot(SH) * En * hemisphere - De.dot(SH) * Ee * hemisphere \
              - SH * DdivdotE * hemisphere
-    G_r_CF = HQiA_u.dot(c_J_CF)
+    if t_shift:
+        G_r_CF = HQiA_u_t.dot(c_J_CF)
+    else:
+        G_r_CF = HQiA_u.dot(c_J_CF)
     return G_r_CF
 
 # dB/dt from DF E
@@ -180,7 +218,7 @@ def calc_A_CFDF(SH, SP, C_i, l1=0, l2=0):
     G_r_CF  = calc_G_r_CF(SH, SP)
     T       = calc_T(G_r_CF, C_i)
     #T       = np.eye(T.shape[0])
-    T_inv   = np.linalg.pinv(T)
+    T_inv   = scipy.linalg.lstsq(T, np.eye(T.shape[0]), lapack_driver='gelsy')[0]
     del T
     
     GTT     = G_r_CF.T @ T_inv
@@ -196,19 +234,102 @@ def calc_A_CFDF(SH, SP, C_i, l1=0, l2=0):
     #A_CFDF = np.linalg.lstsq(GTTG + 1e3*gtgmag*np.eye(GTTG.shape[0]), GTTcE, rcond=None)[0]
     #A_CFDF = np.linalg.solve(GTTG + 1e4*gtgmag*np.eye(GTTG.shape[0]), GTTcE)
     
-    LTL = model.Le.T.dot(model.Le)
-    ltlmag = np.median(np.diag(LTL))
-    A_CFDF = np.linalg.lstsq(GTTG + l1*gtgmag*np.eye(GTTG.shape[0]) + l2*gtgmag/ltlmag*LTL, GTTcE, rcond=None)[0]    
+    #LTL = model.Le.T.dot(model.Le)
+    #ltlmag = np.median(np.diag(LTL))
+    #A_CFDF = np.linalg.lstsq(GTTG + l1*gtgmag*np.eye(GTTG.shape[0]) + l2*gtgmag/ltlmag*LTL, GTTcE, rcond=None)[0]
+    A_CFDF = scipy.linalg.lstsq(GTTG + gtgmag*LTL_A_CFDF, GTTcE, lapack_driver='gelsy')[0]
     
     del GTTG, GTTcE
     
     return A_CFDF
 
+'''
+def calc_A_CF(SH, SP, C_i, l1=0, l2=0):
+    G_r_CF = calc_G_r_CF(SH, SP)
+    
+    G_r_CF_t = calc_G_r_CF(SH, SP, t_shift=False)
+        
+    T = G_r_CF_t @ C_i[:n_CF, :n_CF] @ G_r_CF_t.T + c_E @ C_i[n_CF:, n_CF:] @ c_E.T
+    T_inv = scipy.linalg.lstsq(T, np.eye(T.shape[0]), lapack_driver='gelsy')[0]
+    del T
+    
+    GTT = G_r_CF.T @ T_inv
+    del T_inv
+    
+    GTTG = GTT @ G_r_CF
+    del G_r_CF
+    
+    GTTG_t = GTT @ G_r_CF_t
+    del G_r_CF_t
+    
+    GTTcE   = GTT @ c_E
+    del GTT
+    
+    gtgmag = np.median(np.diag(GTTG))
+        
+    A_CF = scipy.linalg.lstsq(GTTG + gtgmag*LTL_A_CFDF, np.hstack((GTTG_t, GTTcE)), lapack_driver='gelsy')[0]
+    del GTTG, GTTG_t, GTTcE
+    
+    return A_CF
+'''
+
+def calc_A_CF(SH, SP, C_i, l1=0, l2=0):
+    G_r_CF = calc_G_r_CF(SH, SP)
+        
+    
+    G_r_CF_t = calc_G_r_CF(SH, SP, t_shift=False)    
+    
+    T = G_r_CF_t @ C_i[:n_CF, :n_CF] @ G_r_CF_t.T
+    T_inv = scipy.linalg.lstsq(T, np.eye(T.shape[0]), lapack_driver='gelsy')[0]
+    del T
+    
+    GTT = G_r_CF.T @ T_inv
+    del T_inv
+    
+    GTTG = GTT @ G_r_CF
+    gtgmag = np.median(np.diag(GTTG))
+
+    GTTG_t = GTT @ G_r_CF_t
+    del G_r_CF_t, GTT
+
+    #A_CFCF = scipy.linalg.lstsq(GTTG + gtgmag*LTL_A_CFDF, GTTG_t, lapack_driver='gelsy')[0]
+    #A_CFCF = scipy.linalg.lstsq(GTTG, GTTG_t, lapack_driver='gelsy')[0]
+    A_CFCF = scipy.linalg.lstsq(GTTG + gtgmag*LTL_A_CFCF, GTTG_t, lapack_driver='gelsy')[0]
+    #A_CFCF = np.eye(n_CF)
+    del GTTG, GTTG_t
+    
+    '''
+    A_CFCF = Q_shift
+    '''
+
+    T = c_E @ C_i[n_CF:, n_CF:] @ c_E.T
+    T_inv = scipy.linalg.lstsq(T, np.eye(T.shape[0]), lapack_driver='gelsy')[0]
+    del T
+    
+    GTT = G_r_CF.T @ T_inv
+    del T_inv
+    
+    GTTG = GTT @ G_r_CF
+    gtgmag = np.median(np.diag(GTTG))
+    
+    #GTTcE   = GTT @ c_E
+    GTTcE   = GTT @ (Q_shift @ c_E)
+    del GTT
+    
+    A_CFDF = scipy.linalg.lstsq(GTTG + gtgmag*LTL_A_CFDF, GTTcE, lapack_driver='gelsy')[0]    
+    del GTTG, GTTcE
+    
+    
+    return np.hstack((A_CFCF, A_CFDF))
+
+
+
 #%% Step 1: Prepare Dynamic model function
 
 def calc_dmf(SH, SP, C_i, l1=0, l2=0):
-    A_CFDF = calc_A_CFDF(SH, SP, C_i, l1, l2)
-    A_CF = np.hstack((A_CFCF, A_CFDF))
+    #A_CFDF = calc_A_CFDF(SH, SP, C_i, l1, l2)
+    #A_CF = np.hstack((A_CFCF, A_CFDF))
+    A_CF = calc_A_CF(SH, SP, C_i, l1, l2)
     A = np.vstack((A_CF, A_DF))
     return A
 
@@ -253,6 +374,19 @@ C_o = C0 # Old covariance (k-1)
 l1 = 1e3
 l2 = 1e0
 
+LTL_CFCF = model.Le.T.dot(model.Le)
+ltlmag = np.median(np.diag(LTL_CFCF))
+LTL = np.vstack((np.hstack((LTL_CFCF,               np.zeros((n_CF, n_DF)))),
+                 np.hstack((np.zeros((n_DF, n_CF)), np.zeros((n_DF, n_DF)))) ))
+LTL = 1e-1*np.eye(LTL.shape[0]) + 1e-1*LTL/ltlmag
+
+LTL_A_CFDF = l1*np.eye(LTL_CFCF.shape[0]) + l2*LTL_CFCF/ltlmag
+#LTL_A_CFCF = 1e-1*np.eye(LTL_CFCF.shape[0]) + 1e-1*LTL_CFCF/ltlmag
+LTL_A_CFCF = 1e-1*np.eye(LTL_CFCF.shape[0])
+
+# Save for smoother
+As = []
+
 for i, t in tqdm(enumerate(times), total=nt):
 
     ## Prepatation
@@ -280,7 +414,15 @@ for i, t in tqdm(enumerate(times), total=nt):
     # Define process noise
     #Q = .1 * np.diag(np.diag(C_o))
     #Q = .1 * C_o
-    Q = 0.01 * C_o
+    #Q = 0.01 * C_o
+    #Q = 0 * C_o
+    #Q = 0.1 * C_o
+    #Q = 0.1 * C_o
+    Q = .05 * np.diag(np.diag(C0))
+    '''
+    C0_scale = np.max(np.diag(C0))
+    Q = np.diag(np.diag(C_o)) / np.max(np.diag(C_o)) * C0_scale
+    '''
     #Q = .05 * C_o
     #Q = .05 * np.diag(np.diag(C_o))
     
@@ -288,25 +430,33 @@ for i, t in tqdm(enumerate(times), total=nt):
     m_p = A @ m_o             # Prediction of current model (k)
     #C_p = A @ C_o @ A.T + Q   # Prediction of current model covariance (k)
     
-    C_p_inv = np.linalg.pinv(A @ C_o @ A.T)
-    Cpmag = np.median(np.diag(C_p_inv))    
+    C_p_inv = scipy.linalg.lstsq(A @ C_o @ A.T, np.eye(A.shape[0]), lapack_driver='gelsy')[0]
+    #C_p_inv = np.linalg.pinv(A @ C_o @ A.T)
+    Cpmag = np.median(np.diag(C_p_inv))
+    #C_p = np.linalg.pinv(C_p_inv + Cpmag*LTL) + Q
+    C_p = scipy.linalg.lstsq(C_p_inv + Cpmag*LTL, np.eye(C_p_inv.shape[0]), lapack_driver='gelsy')[0] + Q
+    '''
+    C_p = scipy.linalg.lstsq(C_p_inv + Cpmag*LTL, np.eye(C_p_inv.shape[0]), lapack_driver='gelsy')[0]
     
-    LTL = model.Le.T.dot(model.Le)
-    ltlmag = np.median(np.diag(LTL))
-    LTL = np.vstack((np.hstack((LTL,                    np.zeros((n_CF, n_DF)))),
-                     np.hstack((np.zeros((n_DF, n_CF)), np.zeros((n_DF, n_DF)))) ))
-    
-    C_p_inv += 1e-1*Cpmag*np.eye(C_p_inv.shape[0]) + 1e-2*Cpmag/ltlmag*LTL
-    
-    C_p = np.linalg.pinv(C_p_inv) + Q
+    C_p_scale = np.max(np.diag(C_p))
+    if C_p_scale < C0_scale:
+        print('Variance decreasing, scaling')
+        Q = Q * (abs(C_p_scale - C0_scale) / C0_scale)
+        C_p += Q
+    '''
     
     ## Update
     # Calculate various things
     r_p         = d - H @ m_p                       # Calculate residual between data and predictions
-    Cd_p        = H @ C_p @ H.T + np.diag(R)                 # Project predicted model covariance into data and add measurment noise
-    Cd_p_inv    = np.linalg.pinv(Cd_p) # Inverse, needed below
-    #Cd_p_inv    = 1/Cd_p # Inverse, needed below
-    K           = C_p @ H.T @ Cd_p_inv              # Kalman gain
+    CpHT        = C_p @ H.T
+    Cd_p        = H @ CpHT              # Project predicted model covariance into data and add measurment noise
+    tmp         = np.einsum('ii->i', Cd_p)
+    tmp         += R
+    #Cd_p        = H @ CpHT + np.diag(R)                 # Project predicted model covariance into data and add measurment noise
+    
+    Cd_p_inv    = scipy.linalg.lstsq(Cd_p, np.eye(Cd_p.shape[0]), lapack_driver='gelsy')[0]
+    #Cd_p_inv    = np.linalg.pinv(Cd_p) # Inverse, needed below
+    K           = CpHT @ Cd_p_inv              # Kalman gain
     
     # Actual update
     m_c = m_p + K @ r_p         # Update model (k)
@@ -316,15 +466,63 @@ for i, t in tqdm(enumerate(times), total=nt):
     ms[:, i] = m_c
     Cs[:, :, i] = C_c
     rs.append(d - H @ m_c)
-    rmses[i] = rs[i].T @ np.diag(1/R) @ rs[i]
     
-    HAT = H @ np.linalg.pinv(H.T @ np.diag(1/R) @ H) @ (H.T @ np.diag(1/R))
-    n_effs[i] = np.sum(np.diag(HAT))
+    #rmses[i] = rs[i].T @ np.diag(1/R) @ rs[i]
+    rmses[i] = (rs[i] / R).T @ rs[i]
     
+    HTR = H.T * (1/R)
+    Rd = H @ scipy.linalg.lstsq(HTR @ H, np.eye(HTR.shape[0]), lapack_driver='gelsy')[0] @ HTR
+    #Rd = H @ np.linalg.pinv(HTR @ H) @ HTR
+    n_effs[i] = np.trace(Rd)
     
     m_o = m_c
     C_o = C_c
+    
+    As.append(A)
 
+#%%
+'''
+with open('/home/bing/Dropbox/work/temp_storage/As.pkl', 'wb') as f:
+    pickle.dump(As, f)
+
+with open('/home/bing/Dropbox/work/temp_storage/ms.pkl', 'wb') as f:
+    pickle.dump(ms, f)
+
+with open('/home/bing/Dropbox/work/temp_storage/Cs.pkl', 'wb') as f:
+    pickle.dump(Cs, f)
+'''
+#%%
+'''
+with open('/home/bing/Dropbox/work/temp_storage/As.pkl', 'rb') as f:
+    As = pickle.load(f)
+
+with open('/home/bing/Dropbox/work/temp_storage/ms.pkl', 'rb') as f:
+    ms = pickle.load(f)
+
+with open('/home/bing/Dropbox/work/temp_storage/Cs.pkl', 'rb') as f:
+    Cs = pickle.load(f)
+'''
+#%% Smoother
+
+ms_smooth = np.zeros((n, nt))
+Cs_smooth = np.zeros((n, n, nt))
+
+for i in tqdm(range(nt-1, 0-1, -1), total=nt):
+    if i == 99:
+        ms_smooth[:, i] = ms[:, i]
+        Cs_smooth[:, :, i] = Cs[:, :, i]
+    else:
+        A = As[i]
+        m = ms[:, i]
+        C = Cs[:, :, i]
+    
+        m_guess = A.dot(m)
+        C_guess = A.dot(C).dot(A.T) + Q
+    
+        Ck = C.dot(A.T).dot(scipy.linalg.lstsq(C_guess, np.eye(C_guess.shape[0]), lapack_driver='gelsy')[0])
+        ms_smooth[:, i] = m + Ck.dot(ms_smooth[:, i+1] - m_guess)
+        Cs_smooth[:, :, i] = C + Ck.dot(Cs_smooth[:, :, i+1] - C_guess).dot(Ck.T)
+        
 #%%
 
 chi_l = scipy.stats.chi2.ppf(.025, n_effs)
@@ -339,7 +537,7 @@ plt.plot(rmses, color='tab:orange', label='Chi squared')
 
 plt.xlabel('Time step')
 plt.ylabel('Chi squared')
-plt.title('0.01*C_o : l1=0 : l2=1e-2 : With spatial weights')
+plt.title('0.1*C0 : l1=1e-1 : l2=1e-1 : With spatial weights')
 
 
 #%%
@@ -363,7 +561,7 @@ for j in range(1,6):
 plt.ioff()
 apex = apexpy.Apex(2012, refh = 110)
 #savepath = path_out + 'figures/kalman_m_CF_1e{}_1e{}/'.format(int(np.log10(l1)), int(np.log10(l2)))
-savepath = path_out + 'figures/kalman_m_CF_test/'
+savepath = path_out + 'figures/kalman_m_CF_test_new/'
 try:
     os.mkdir(savepath)
 except:
@@ -382,8 +580,38 @@ plt.close('all')
 for i, t in tqdm(enumerate(times), total=nt):
     model.clear_model(Hall_Pedersen_conductance = (SH_fun, SP_fun)) # reset
     amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
-    model.add_data(amp_data, sm_data, sd_data)
+    model.add_data(amp_data, sm_data, sd_data) 
     model.m = ms[:n_CF, i]
+    savefile = savepath + str(t).replace(' ','_').replace(':','')
+    lompe.lompeplot(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
+    plt.close('all')
+plt.ion()
+
+#%% Plot m_CF smoothed
+
+plt.ioff()
+apex = apexpy.Apex(2012, refh = 110)
+savepath = path_out + 'figures/kalman_m_CF_test_smoothed/'
+try:
+    os.mkdir(savepath)
+except:
+    print('Folder already exists')
+
+t = times[0]
+model.clear_model(Hall_Pedersen_conductance = (SH_fun, SP_fun)) # reset
+amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
+model.add_data(amp_data, sm_data, sd_data)
+model.m = m0[:n_CF]
+#model.m = (A @ m_o)[:n_CF]
+savefile = savepath + 'init'
+lompe.lompeplot(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
+plt.close('all')
+
+for i, t in tqdm(enumerate(times), total=nt):
+    model.clear_model(Hall_Pedersen_conductance = (SH_fun, SP_fun)) # reset
+    amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
+    model.add_data(amp_data, sm_data, sd_data) 
+    model.m = ms_smooth[:n_CF, i]
     savefile = savepath + str(t).replace(' ','_').replace(':','')
     lompe.lompeplot(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
     plt.close('all')
@@ -391,10 +619,25 @@ plt.ion()
 
 #%% Plot m_DF
 
+# Default arrow scales (all SI units):
+QUIVERSCALES = {'ground_mag':       600 * 1e-9 , # ground magnetic field scale [T]
+                'space_mag_fac':    600 * 1e-9 , # FAC magnetic field scale [T]
+                'convection':       2000       , # convection velocity scale [m/s]
+                'efield':           100  * 1e-3, # electric field scale [V/m]
+                'electric_current': 200 * 1e-3, # electric surface current density [A/m] Ohm's law 
+                'secs_current':     1000 * 1e-3, # electric surface current density [A/m] SECS 
+                'space_mag_full':   600 * 1e-9 } # FAC magnetic field scale [T]
+
+# Default color scales (SI units):
+COLORSCALES =  {'fac':        np.linspace(-.5, .5, 40) * 1e-6 * 2,
+                'ground_mag': np.linspace(-50, 50, 50) * 1e-9, # upward component
+                'hall':       np.linspace(0, 20, 32), # mho
+                'pedersen':   np.linspace(0, 20, 32)} # mho
+
 plt.ioff()
 apex = apexpy.Apex(2012, refh = 110)
 #savepath = path_out + 'figures/kalman_m_DF_1e{}_1e{}/'.format(int(np.log10(l1)), int(np.log10(l2)))
-savepath = path_out + 'figures/kalman_m_DF_test/'
+savepath = path_out + 'figures/kalman_m_DF_test_new/'
 try:
     os.mkdir(savepath)
 except:
@@ -407,19 +650,53 @@ model.add_data(amp_data, sm_data, sd_data)
 model.m = m0[n_CF:]
 #model.m = (A @ m_o)[n_CF:]
 savefile = savepath + 'init'
-lompe.lompeplot_DF(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
+lompe.lompeplot_DF(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200}, 
+                   quiverscales=QUIVERSCALES, colorscales=COLORSCALES)
 plt.close('all')
 
-for i, t in tqdm(enumerate(times[:6]), total=nt):
+for i, t in tqdm(enumerate(times), total=nt):
     model.clear_model(Hall_Pedersen_conductance = (SH_fun, SP_fun)) # reset
     amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
     model.add_data(amp_data, sm_data, sd_data)
     model.m = ms[n_CF:, i]
     savefile = savepath + str(t).replace(' ','_').replace(':','')
-    lompe.lompeplot_DF(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
+    lompe.lompeplot_DF(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200}, 
+                       quiverscales=QUIVERSCALES, colorscales=COLORSCALES)
     plt.close('all')
 plt.ion()
 
+#%% Plot m_DF
+
+plt.ioff()
+apex = apexpy.Apex(2012, refh = 110)
+#savepath = path_out + 'figures/kalman_m_DF_1e{}_1e{}/'.format(int(np.log10(l1)), int(np.log10(l2)))
+savepath = path_out + 'figures/kalman_m_DF_test_smooth/'
+try:
+    os.mkdir(savepath)
+except:
+    print('Folder already exists')
+
+t = times[0]
+model.clear_model(Hall_Pedersen_conductance = (SH_fun, SP_fun)) # reset
+amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
+model.add_data(amp_data, sm_data, sd_data)
+model.m = m0[n_CF:]
+#model.m = (A @ m_o)[n_CF:]
+savefile = savepath + 'init'
+lompe.lompeplot_DF(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200}, 
+                   quiverscales=QUIVERSCALES, colorscales=COLORSCALES)
+plt.close('all')
+
+for i, t in tqdm(enumerate(times), total=nt):
+    model.clear_model(Hall_Pedersen_conductance = (SH_fun, SP_fun)) # reset
+    amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
+    model.add_data(amp_data, sm_data, sd_data)
+    model.m = ms_smooth[n_CF:, i]
+    savefile = savepath + str(t).replace(' ','_').replace(':','')
+    lompe.lompeplot_DF(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200}, 
+                       quiverscales=QUIVERSCALES, colorscales=COLORSCALES)
+    plt.close('all')
+plt.ion()
 
 #%% Step 4: Save filtered models
 

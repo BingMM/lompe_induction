@@ -52,7 +52,8 @@ def prepare_data(t0, t1):
     vlos = vlos[f]
     los = los[:, f]
     coords = coords[:, f]
-    sd_data = lompe.Data(vlos, coordinates = coords, LOS = los, datatype = 'convection', error = 50, iweight=1.0)
+    #sd_data = lompe.Data(vlos, coordinates = coords, LOS = los, datatype = 'convection', error = 50, iweight=1.0)
+    sd_data = lompe.Data(vlos, coordinates = coords, LOS = los, datatype = 'convection', error = 200, iweight=1.0)
     
     return amp_data, sm_data, sd_data
 
@@ -73,7 +74,7 @@ ampere    = pd.read_hdf(iridiumfn)
 supermag  = pd.read_hdf(supermagfn)
 superdarn = pd.read_hdf(superdarnfn)
 
-times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min')[:20] # Limiting testing to the first 100, instead of all 480 times
+times = pd.date_range('2012-04-05 00:00', '2012-04-05 23:59', freq = '3Min')[:100] # Limiting testing to the first 100, instead of all 480 times
 DT    = timedelta(seconds = 2 * 60) # will select data from +- DT
 
 #%% Define grid
@@ -92,6 +93,8 @@ Kp = 4 # for Hardy conductance model
 #%% Step 1 + 3: Standard Lompe inversion and plot
 
 ms = []
+n_effs = np.zeros(times.size)
+rmses = np.zeros(times.size)
 
 apex = apexpy.Apex(2012, refh = 110)
 for i, t in tqdm(enumerate(times), total=times.size):
@@ -107,13 +110,24 @@ for i, t in tqdm(enumerate(times), total=times.size):
     amp_data, sm_data, sd_data = prepare_data(t - DT, t + DT)
     model.add_data(amp_data, sm_data, sd_data)
     gtg, ltl = model.run_inversion(l1 = 2, l2 = 0, save_matrices=True)
-
+    
+    #HAT = model._G @ np.linalg.lstsq(gtg + 2*np.median(np.diag(gtg))*np.eye(gtg.shape[0]), model._G.T @ np.diag(model._w), rcond=None)[0]
+    HAT = model._G @ np.linalg.pinv(gtg + 2*np.median(np.diag(gtg))*np.eye(gtg.shape[0])) @ (model._G.T @ np.diag(model._w))
+    #HAT = H @ np.linalg.pinv(H.T @ np.diag(1/R) @ H) @ (H.T @ np.diag(1/R))
+    
+    n_effs[i] = np.trace(HAT)
+    
+    rs = model._d - model._G @ model.m
+    rmses[i] = (rs * model._w).T @ rs
+    
+    '''
     plt.ioff()
     savepath = path_out + 'figures/standard_lompe/'
     savefile = savepath + str(t).replace(' ','_').replace(':','')
     lompe.lompeplot(model, include_data = True, time = t, apex = apex, savekw = {'fname': savefile, 'dpi' : 200})
     plt.close('all')
     plt.ion()
+    '''
     
     ms.append(model.m)
 
